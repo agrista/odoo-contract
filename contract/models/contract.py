@@ -6,11 +6,15 @@
 # Copyright 2018 ACSONE SA/NV
 # Copyright 2021 Tecnativa - Víctor Martínez
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
+import logging
 
 from odoo import api, fields, models
 from odoo.exceptions import UserError, ValidationError
+from odoo.osv import expression
 from odoo.tests import Form
 from odoo.tools.translate import _
+
+_logger = logging.getLogger(__name__)
 
 
 class ContractContract(models.Model):
@@ -89,6 +93,7 @@ class ContractContract(models.Model):
         string="Invoicing contact",
         comodel_name="res.partner",
         ondelete="restrict",
+        domain="['|', ('id', 'parent_of', partner_id), ('id', 'child_of', partner_id)]",
     )
     partner_id = fields.Many2one(
         comodel_name="res.partner", inverse="_inverse_partner_id", required=True
@@ -371,15 +376,6 @@ class ContractContract(models.Model):
         else:
             self.payment_term_id = partner.property_payment_term_id
         self.invoice_partner_id = self.partner_id.address_get(["invoice"])["invoice"]
-        return {
-            "domain": {
-                "invoice_partner_id": [
-                    "|",
-                    ("id", "parent_of", self.partner_id.id),
-                    ("id", "child_of", self.partner_id.id),
-                ]
-            }
-        }
 
     def _convert_contract_lines(self, contract):
         self.ensure_one()
@@ -595,19 +591,46 @@ class ContractContract(models.Model):
         return moves
 
     @api.model
-    def cron_recurring_create_invoice(self, date_ref=None):
+    def _get_recurring_create_func(self, create_type="invoice"):
+        """
+        Allows to retrieve the recurring create function depending
+        on generate_type attribute
+        """
+        if create_type == "invoice":
+            return self.__class__._recurring_create_invoice
+
+    @api.model
+    def _cron_recurring_create(self, date_ref=False, create_type="invoice"):
+        """
+        The cron function in order to create recurrent documents
+        from contracts.
+        """
+        _recurring_create_func = self._get_recurring_create_func(
+            create_type=create_type
+        )
         if not date_ref:
             date_ref = fields.Date.context_today(self)
         domain = self._get_contracts_to_invoice_domain(date_ref)
-        invoices = self.env["account.move"]
+        domain = expression.AND(
+            [
+                domain,
+                [("generation_type", "=", create_type)],
+            ]
+        )
+        contracts = self.search(domain)
+        companies = set(contracts.mapped("company_id"))
         # Invoice by companies, so assignation emails get correct context
-        companies_to_invoice = self.read_group(domain, ["company_id"], ["company_id"])
-        for row in companies_to_invoice:
-            contracts_to_invoice = self.search(row["__domain"]).with_context(
-                allowed_company_ids=[row["company_id"][0]]
-            )
-            invoices |= contracts_to_invoice._recurring_create_invoice(date_ref)
-        return invoices
+        for company in companies:
+            contracts_to_invoice = contracts.filtered(
+                lambda c: c.company_id == company
+                and (not c.date_end or c.recurring_next_date <= c.date_end)
+            ).with_company(company)
+            _recurring_create_func(contracts_to_invoice, date_ref)
+        return True
+
+    @api.model
+    def cron_recurring_create_invoice(self, date_ref=None):
+        return self._cron_recurring_create(date_ref, create_type="invoice")
 
     def action_terminate_contract(self):
         self.ensure_one()
